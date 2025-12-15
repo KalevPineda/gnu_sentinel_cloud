@@ -13,21 +13,24 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tower_http::cors::CorsLayer;
+use tower_http::cors::Any;
+
 
 // --- ESTRUCTURAS DE DATOS ---
 
-// Configuración Controlable desde la Web
+// 1. Configuración (Se envía al Core)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct RemoteConfig {
-    max_temp_trigger: f32,
-    scan_wait_time_sec: u64,
-    system_enabled: bool, // Switch maestro ON/OFF
+    max_temp_trigger: f32,   // Umbral de alerta
+    scan_wait_time_sec: u64, // Tiempo de espera en bordes
+    system_enabled: bool,    // Interruptor maestro
+    pan_step_degrees: f32,   // Velocidad
 }
 
-// Estado "Vivo" del robot (Telemetría)
+// 2. Estado en Vivo (Viene del Core)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct LiveStatus {
-    last_update: u64, // Unix Timestamp
+    last_update: u64,
     turbine_token: String,
     mode: String,
     current_angle: f32,
@@ -35,7 +38,7 @@ struct LiveStatus {
     is_online: bool,
 }
 
-// Alerta histórica
+// 3. Registro de Alerta (Historial para la Web)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AlertRecord {
     id: String,
@@ -43,33 +46,50 @@ struct AlertRecord {
     turbine_token: String,
     max_temp: f32,
     angle: f32,
-    dataset_path: String, // Ruta al archivo .npz para análisis detallado
+    dataset_path: String, // Nombre del archivo .npz
 }
 
-// Estado Global en Memoria RAM
+// 4. Punto de datos para graficar evolución
+#[derive(Serialize)]
+struct EvolutionPoint {
+    frame_index: usize,
+    max_temp: f32,
+    avg_temp: f32,
+}
+
+// 5. Estado Global de la Aplicación (Memoria RAM)
 struct AppState {
-    // Configuración que el Core descargará
     config: Arc<RwLock<RemoteConfig>>,
-    // Último estado conocido (para el Dashboard en vivo)
     live_status: Arc<RwLock<LiveStatus>>,
-    // Historial de alertas (en prod usarías una Base de Datos SQL)
     alerts: Arc<RwLock<VecDeque<AlertRecord>>>,
 }
 
 #[tokio::main]
 async fn main() {
+    // Iniciar logs
     tracing_subscriber::fmt::init();
+    let cors = CorsLayer::new()
+        .allow_origin(Any)      // Acepta localhost:5173, localhost:3000, 192.168...
+        .allow_methods(Any)     // Acepta GET, POST, OPTIONS
+        .allow_headers(Any);    // Acepta Content-Type json
 
-    // Estado inicial por defecto
+
+    // Crear carpeta para guardar archivos si no existe
+    if let Err(e) = std::fs::create_dir_all("cloud_storage") {
+        eprintln!("⚠️ Advertencia: No se pudo crear carpeta cloud_storage: {}", e);
+    }
+
+    // Estado Inicial
     let shared_state = Arc::new(AppState {
         config: Arc::new(RwLock::new(RemoteConfig {
             max_temp_trigger: 50.0,
             scan_wait_time_sec: 5,
             system_enabled: true,
+            pan_step_degrees: 0.5,
         })),
         live_status: Arc::new(RwLock::new(LiveStatus {
             last_update: 0,
-            turbine_token: "unknown".into(),
+            turbine_token: "Esperando conexión...".into(),
             mode: "Offline".into(),
             current_angle: 0.0,
             current_max_temp: 0.0,
@@ -78,148 +98,177 @@ async fn main() {
         alerts: Arc::new(RwLock::new(VecDeque::new())),
     });
 
-    // Crear carpeta de almacenamiento
-    std::fs::create_dir_all("cloud_storage").unwrap();
-
+    // Definición de Rutas
     let app = Router::new()
         // --- API PARA LA INTERFAZ WEB / MÓVIL ---
-        .route("/api/live", get(get_live_status))          // Ver estado actual
+        .route("/api/live", get(get_live_status))                  // Datos tiempo real
         .route("/api/config", get(get_config).post(update_config)) // Leer/Escribir config
-        .route("/api/alerts", get(get_alerts))             // Listar alertas
-        .route("/api/evolution/:filename", get(get_evolution_data)) // Gráfica detallada
+        .route("/api/alerts", get(get_alerts))                     // Historial
+        .route("/api/evolution/:filename", get(get_evolution_data)) // Datos para gráficas
         
         // --- API PARA EL ROBOT (CORE) ---
-        .route("/ingest/heartbeat", post(heartbeat_handler)) // Telemetría ligera
-        .route("/ingest/upload", post(upload_handler))       // Subida de archivos pesados
+        .route("/ingest/heartbeat", post(heartbeat_handler)) // Ping cada 1s
+        .route("/ingest/upload", post(upload_handler))       // Subida de archivos
         
-        // Permitir CORS (para que tu frontend React/Vue/HTML pueda conectarse)
-        .layer(CorsLayer::permissive())
+        // Middleware: CORS (Permite que React/Vue/HTML accedan a la API)
+        //.layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(shared_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("☁️ GSU Cloud API lista en {}", addr);
+    let addr = SocketAddr::from(([192,168,0,4], 8080));
+    println!("☁️ GSU Sentinel Cloud escuchando en http://{}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- HANDLERS PARA WEB/APP ---
+// --- HANDLERS (Lógica del Servidor) ---
 
-// 1. Dashboard en Vivo: Retorna JSON ligero para pintar agujas/textos
+// [WEB] Obtener estado en vivo
 async fn get_live_status(State(state): State<Arc<AppState>>) -> Json<LiveStatus> {
-    let status = state.live_status.read().unwrap();
-    // Aquí podrías lógica para marcar is_online = false si last_update es muy viejo
-    Json(status.clone())
+    let mut status = state.live_status.read().unwrap().clone();
+    
+    // Si no hemos recibido datos en 5 segundos, marcar como Offline
+    let now = chrono::Utc::now().timestamp() as u64;
+    if now > status.last_update + 5 {
+        status.is_online = false;
+        status.mode = "Lost Connection".to_string();
+    }
+    
+    Json(status)
 }
 
-// 2. Control: Obtener y Actualizar configuración
+// [WEB] Obtener Configuración
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<RemoteConfig> {
     Json(state.config.read().unwrap().clone())
 }
 
-async fn update_config(State(state): State<Arc<AppState>>, Json(new_conf): Json<RemoteConfig>) -> Json<&'static str> {
+// [WEB] Actualizar Configuración
+async fn update_config(
+    State(state): State<Arc<AppState>>, 
+    Json(new_conf): Json<RemoteConfig>
+) -> Json<&'static str> {
     let mut conf = state.config.write().unwrap();
     *conf = new_conf;
-    println!("⚙️ Configuración actualizada desde Web: Temp Trigger > {}", conf.max_temp_trigger);
-    Json("updated")
+    println!("⚙️ Configuración actualizada vía Web: Trigger={}°C", conf.max_temp_trigger);
+    Json("Config updated successfully")
 }
 
-// 3. Notificaciones: Listar alertas recientes
+// [WEB] Ver historial de alertas
 async fn get_alerts(State(state): State<Arc<AppState>>) -> Json<Vec<AlertRecord>> {
     let alerts = state.alerts.read().unwrap();
     Json(alerts.iter().cloned().collect())
 }
 
-// 4. Evolución: Abre el .npz y extrae la curva de temperatura
-#[derive(Serialize)]
-struct EvolutionPoint {
-    frame_index: usize,
-    max_temp: f32,
-    avg_temp: f32,
-}
-
+// [WEB] Analizar archivo NPZ para gráficas
 async fn get_evolution_data(Path(filename): Path<String>) -> Json<Vec<EvolutionPoint>> {
     let path = format!("cloud_storage/{}", filename);
     let mut points = Vec::new();
 
-    // Intenta abrir el archivo .npz (Esto bloquea un poco, en prod usar spawn_blocking)
-    if let Ok(file) = File::open(path) {
-        // Leemos la matriz guardada. Asumimos que guardamos un array 3D o una lista de arrays.
-        // NOTA: Para simplificar, asumiremos que el Core guardó un solo Array2 caliente, 
-        // pero idealmente guardarías un stack de frames.
-        // Aquí simulamos lectura de un frame para el ejemplo:
+    // Intentamos abrir el archivo
+    if let Ok(file) = File::open(&path) {
+        // Leemos la matriz guardada por el Core
         if let Ok(matrix) = Array2::<f32>::read_npy(file) {
-            // Generamos un punto único (en realidad iterarías sobre frames temporales)
-            //let max = matrix.fold(0./0., |a, &b| a.max(b));
-            // Usamos f32::NEG_INFINITY como valor inicial, que es explícitamente f32 
-            // y es la forma correcta de iniciar una búsqueda de máximo.
-            let max = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let sum: f32 = matrix.sum();
-            let avg = sum / matrix.len() as f32;
             
-            points.push(EvolutionPoint { frame_index: 0, max_temp: max, avg_temp: avg });
+            // CORRECCIÓN: Usamos f32::NEG_INFINITY para evitar error de tipo ambiguo
+            let max_val = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            
+            let sum: f32 = matrix.sum();
+            let count = matrix.len() as f32;
+            let avg_val = if count > 0.0 { sum / count } else { 0.0 };
+
+            // En un sistema real, el archivo podría tener múltiples frames (tiempo).
+            // Aquí asumimos que es una "foto" del momento más caliente.
+            points.push(EvolutionPoint { 
+                frame_index: 1, 
+                max_temp: max_val, 
+                avg_temp: avg_val 
+            });
         }
+    } else {
+        println!("⚠️ Error: No se encontró el archivo {}", path);
     }
+    
     Json(points)
 }
 
-// --- HANDLERS PARA GSU CORE ---
-
-// Recibe datos cada segundo
+// [CORE] Heartbeat: Recibe estado, devuelve config
 async fn heartbeat_handler(
     State(state): State<Arc<AppState>>, 
     Json(payload): Json<LiveStatus>
 ) -> Json<RemoteConfig> {
-    // 1. Actualizar estado "vivo"
+    // 1. Guardar estado del robot
     {
         let mut status = state.live_status.write().unwrap();
         *status = payload;
-        status.is_online = true;
         status.last_update = chrono::Utc::now().timestamp() as u64;
+        status.is_online = true;
     }
 
-    // 2. Responder con la configuración actual (así el robot se sincroniza)
+    // 2. Responder con la configuración actual
     let config = state.config.read().unwrap().clone();
     Json(config)
 }
 
+// [CORE] Upload: Recibe archivos pesados
 async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart
 ) -> Json<&'static str> {
+    
     let mut turbine_token = String::new();
     let mut angle = 0.0;
-    let mut filename = String::new();
-    
-    // Procesar campos
+    let mut file_saved_name = String::new();
+    let mut temp_max_detected = 0.0; // Idealmente el Core debería enviar esto en un campo de texto también
+
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
         
         if name == "turbine_token" {
-            turbine_token = field.text().await.unwrap();
+            if let Ok(txt) = field.text().await { turbine_token = txt; }
         } else if name == "angle" {
-            if let Ok(val) = field.text().await.unwrap().parse::<f32>() { angle = val; }
+            if let Ok(txt) = field.text().await {
+                angle = txt.parse().unwrap_or(0.0);
+            }
         } else if name == "dataset_file" {
+            // Guardar archivo
             let data = field.bytes().await.unwrap();
-            let ts = chrono::Utc::now().timestamp();
-            filename = format!("capture_{}_{}.npz", turbine_token, ts);
-            let path = format!("cloud_storage/{}", filename);
-            let _ = tokio::fs::write(&path, data).await;
-            println!("💾 Archivo guardado: {}", path);
+            let timestamp = chrono::Utc::now().timestamp();
+            // Nombre seguro para el archivo
+            file_saved_name = format!("capture_{}_{}.npz", turbine_token, timestamp);
+            let filepath = format!("cloud_storage/{}", file_saved_name);
+            
+            if let Err(e) = tokio::fs::write(&filepath, &data).await {
+                eprintln!("Error escribiendo archivo: {}", e);
+                return Json("write_error");
+            }
+            println!("💾 Archivo recibido y guardado: {}", filepath);
+            
+            // ANALISIS RÁPIDO: Abrimos el archivo en memoria para sacar la temperatura máxima
+            // y guardarla en la alerta sin esperar al usuario.
+            if let Ok(matrix) = Array2::<f32>::read_npy(std::io::Cursor::new(&data)) {
+                 temp_max_detected = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            }
         }
     }
 
-    // Registrar Alerta
-    if !filename.is_empty() {
+    // Registrar Alerta si hubo archivo
+    if !file_saved_name.is_empty() {
         let alert = AlertRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().timestamp() as u64,
             turbine_token,
+            max_temp: temp_max_detected,
             angle,
-            max_temp: 0.0, // Se actualizaría procesando el archivo o enviándolo en el form
-            dataset_path: filename,
+            dataset_path: file_saved_name,
         };
+        
         state.alerts.write().unwrap().push_front(alert);
+        
+        // Limitar historial a 50 alertas para no llenar RAM
+        if state.alerts.read().unwrap().len() > 50 {
+            state.alerts.write().unwrap().pop_back();
+        }
     }
 
     Json("upload_success")
