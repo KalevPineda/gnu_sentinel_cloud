@@ -1,0 +1,52 @@
+[package]
+name = "gcu_sentinel_cloud"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# --- CORE WEB FRAMEWORK ---
+# Axum: El framework web más rápido y ergonómico para Rust actualmente.
+# Features: 'multipart' es crucial para recibir los archivos .npz grandes.
+axum = { version = "0.7", features = ["multipart", "macros"] }
+
+# --- ASYNC RUNTIME ---
+# Tokio: El motor asíncrono estándar. "full" habilita FS, Net, Time, etc.
+tokio = { version = "1.36", features = ["full"] }
+
+# --- MIDDLEWARE & UTILIDADES HTTP (CRÍTICO PARA NUBE) ---
+# Tower-HTTP: Maneja CORS (para que tu dashboard web pueda pedir datos), 
+# Trace (logs de requests) y Limits (para evitar ataques DoS con archivos gigantes).
+tower-http = { version = "0.5", features = ["cors", "trace", "limit", "timeout"] }
+
+# --- SERIALIZACIÓN ---
+# Serde: Para convertir Structs a JSON y viceversa.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- LOGGING & OBSERVABILIDAD ---
+# Es vital en la nube saber qué está pasando.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- MANEJO DE TIEMPO ---
+# Chrono: Para timestamps compatibles con SQL y JSON.
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- CONFIGURACIÓN ---
+# Dotenvy: Para cargar variables de entorno (DB_URL, API_KEYS) desde un archivo .env
+dotenvy = "0.15"
+
+# --- MANEJO DE ERRORES ---
+anyhow = "1.0" # Simplifica el retorno de errores complejos
+
+# --- BASE DE DATOS (Producción) ---
+# Descomenta esto cuando integres PostgreSQL.
+# sqlx es asíncrono y verifica tus queries en tiempo de compilación.
+# sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true # Reduce el tamaño del binario final para Docker
