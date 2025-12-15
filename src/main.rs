@@ -115,7 +115,7 @@ async fn main() {
         .layer(cors)
         .with_state(shared_state);
 
-    let addr = SocketAddr::from(([192,168,0,4], 8080));
+    let addr = SocketAddr::from(([0,0,0,0], 8080));
     println!("☁️ GSU Sentinel Cloud escuchando en http://{}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
