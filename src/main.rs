@@ -10,11 +10,11 @@ use std::{
     collections::VecDeque,
     fs::File,
     net::SocketAddr,
+    path::PathBuf, // Importante para rutas seguras en Linux
     sync::{Arc, RwLock},
 };
-use tower_http::cors::CorsLayer;
-use tower_http::cors::Any;
-
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir; // Importante para servir archivos estáticos
 
 // --- ESTRUCTURAS DE DATOS ---
 
@@ -68,15 +68,21 @@ struct AppState {
 async fn main() {
     // Iniciar logs
     tracing_subscriber::fmt::init();
-    let cors = CorsLayer::new()
-        .allow_origin(Any)      // Acepta localhost:5173, localhost:3000, 192.168...
-        .allow_methods(Any)     // Acepta GET, POST, OPTIONS
-        .allow_headers(Any);    // Acepta Content-Type json
 
+    // Configuración CORS Permisiva (Para que tu Web pueda conectarse desde cualquier lugar)
+    let cors = CorsLayer::new()
+        .allow_origin(Any)      
+        .allow_methods(Any)     
+        .allow_headers(Any);    
+
+    // Nombre de la carpeta de almacenamiento
+    let storage_folder = "cloud_storage";
 
     // Crear carpeta para guardar archivos si no existe
-    if let Err(e) = std::fs::create_dir_all("cloud_storage") {
-        eprintln!("⚠️ Advertencia: No se pudo crear carpeta cloud_storage: {}", e);
+    if let Err(e) = std::fs::create_dir_all(storage_folder) {
+        eprintln!("⚠️ Advertencia: No se pudo crear carpeta {}: {}", storage_folder, e);
+    } else {
+        println!("📂 Carpeta '{}' lista.", storage_folder);
     }
 
     // Estado Inicial
@@ -101,28 +107,32 @@ async fn main() {
     // Definición de Rutas
     let app = Router::new()
         // --- API PARA LA INTERFAZ WEB / MÓVIL ---
-        .route("/api/live", get(get_live_status))                  // Datos tiempo real
-        .route("/api/config", get(get_config).post(update_config)) // Leer/Escribir config
-        .route("/api/alerts", get(get_alerts))                     // Historial
-        .route("/api/evolution/:filename", get(get_evolution_data)) // Datos para gráficas
+        .route("/api/live", get(get_live_status))                  
+        .route("/api/config", get(get_config).post(update_config)) 
+        .route("/api/alerts", get(get_alerts))                     
+        .route("/api/evolution/:filename", get(get_evolution_data)) 
         
         // --- API PARA EL ROBOT (CORE) ---
-        .route("/ingest/heartbeat", post(heartbeat_handler)) // Ping cada 1s
-        .route("/ingest/upload", post(upload_handler))       // Subida de archivos
+        .route("/ingest/heartbeat", post(heartbeat_handler)) 
+        .route("/ingest/upload", post(upload_handler))       
         
-        // Middleware: CORS (Permite que React/Vue/HTML accedan a la API)
-        //.layer(CorsLayer::permissive())
+        // --- SERVICIO DE ARCHIVOS ESTÁTICOS (Corrección para descargar archivos) ---
+        // Esto permite que tu web acceda a: http://TU_VPS:8080/files/archivo.npz
+        .nest_service("/files", ServeDir::new(storage_folder))
+
+        // Middleware
         .layer(cors)
         .with_state(shared_state);
 
-    let addr = SocketAddr::from(([0,0,0,0], 8080));
+    // Escuchar en 0.0.0.0 es OBLIGATORIO para VPS
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("☁️ GSU Sentinel Cloud escuchando en http://{}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- HANDLERS (Lógica del Servidor) ---
+// --- HANDLERS ---
 
 // [WEB] Obtener estado en vivo
 async fn get_live_status(State(state): State<Arc<AppState>>) -> Json<LiveStatus> {
@@ -130,7 +140,8 @@ async fn get_live_status(State(state): State<Arc<AppState>>) -> Json<LiveStatus>
     
     // Si no hemos recibido datos en 5 segundos, marcar como Offline
     let now = chrono::Utc::now().timestamp() as u64;
-    if now > status.last_update + 5 {
+    // Chequeo de seguridad para evitar overflow en resta
+    if now > status.last_update.saturating_add(5) {
         status.is_online = false;
         status.mode = "Lost Connection".to_string();
     }
@@ -162,12 +173,15 @@ async fn get_alerts(State(state): State<Arc<AppState>>) -> Json<Vec<AlertRecord>
 
 // [WEB] Analizar archivo NPZ para gráficas
 async fn get_evolution_data(Path(filename): Path<String>) -> Json<Vec<EvolutionPoint>> {
-    let path = format!("cloud_storage/{}", filename);
+    // Uso de PathBuf para evitar ataques de directorio (ej ../../)
+    let mut path = PathBuf::from("cloud_storage");
+    path.push(&filename);
+    
     let mut points = Vec::new();
 
     // Intentamos abrir el archivo
     if let Ok(file) = File::open(&path) {
-        // Leemos la matriz guardada por el Core
+        // Leemos la matriz guardada
         if let Ok(matrix) = Array2::<f32>::read_npy(file) {
             
             // CORRECCIÓN: Usamos f32::NEG_INFINITY para evitar error de tipo ambiguo
@@ -177,8 +191,6 @@ async fn get_evolution_data(Path(filename): Path<String>) -> Json<Vec<EvolutionP
             let count = matrix.len() as f32;
             let avg_val = if count > 0.0 { sum / count } else { 0.0 };
 
-            // En un sistema real, el archivo podría tener múltiples frames (tiempo).
-            // Aquí asumimos que es una "foto" del momento más caliente.
             points.push(EvolutionPoint { 
                 frame_index: 1, 
                 max_temp: max_val, 
@@ -186,31 +198,29 @@ async fn get_evolution_data(Path(filename): Path<String>) -> Json<Vec<EvolutionP
             });
         }
     } else {
-        println!("⚠️ Error: No se encontró el archivo {}", path);
+        println!("⚠️ Error: No se encontró el archivo {:?}", path);
     }
     
     Json(points)
 }
 
-// [CORE] Heartbeat: Recibe estado, devuelve config
+// [CORE] Heartbeat
 async fn heartbeat_handler(
     State(state): State<Arc<AppState>>, 
     Json(payload): Json<LiveStatus>
 ) -> Json<RemoteConfig> {
-    // 1. Guardar estado del robot
     {
         let mut status = state.live_status.write().unwrap();
         *status = payload;
         status.last_update = chrono::Utc::now().timestamp() as u64;
         status.is_online = true;
     }
-
-    // 2. Responder con la configuración actual
+    // Responder con la configuración
     let config = state.config.read().unwrap().clone();
     Json(config)
 }
 
-// [CORE] Upload: Recibe archivos pesados
+// [CORE] Upload
 async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart
@@ -219,7 +229,7 @@ async fn upload_handler(
     let mut turbine_token = String::new();
     let mut angle = 0.0;
     let mut file_saved_name = String::new();
-    let mut temp_max_detected = 0.0; // Idealmente el Core debería enviar esto en un campo de texto también
+    let mut temp_max_detected = 0.0; 
 
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
@@ -231,28 +241,30 @@ async fn upload_handler(
                 angle = txt.parse().unwrap_or(0.0);
             }
         } else if name == "dataset_file" {
-            // Guardar archivo
+            // Obtener bytes
             let data = field.bytes().await.unwrap();
             let timestamp = chrono::Utc::now().timestamp();
-            // Nombre seguro para el archivo
-            file_saved_name = format!("capture_{}_{}.npz", turbine_token, timestamp);
-            let filepath = format!("cloud_storage/{}", file_saved_name);
             
+            // Construir nombre y ruta segura
+            file_saved_name = format!("capture_{}_{}.npz", turbine_token, timestamp);
+            let mut filepath = PathBuf::from("cloud_storage");
+            filepath.push(&file_saved_name);
+            
+            // Guardar archivo
             if let Err(e) = tokio::fs::write(&filepath, &data).await {
-                eprintln!("Error escribiendo archivo: {}", e);
+                eprintln!("❌ Error escribiendo archivo en {:?}: {}", filepath, e);
                 return Json("write_error");
             }
-            println!("💾 Archivo recibido y guardado: {}", filepath);
+            println!("💾 Archivo recibido y guardado: {:?}", filepath);
             
-            // ANALISIS RÁPIDO: Abrimos el archivo en memoria para sacar la temperatura máxima
-            // y guardarla en la alerta sin esperar al usuario.
+            // Análisis Rápido (sin leer de disco, usando los bytes en memoria)
             if let Ok(matrix) = Array2::<f32>::read_npy(std::io::Cursor::new(&data)) {
                  temp_max_detected = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             }
         }
     }
 
-    // Registrar Alerta si hubo archivo
+    // Registrar Alerta
     if !file_saved_name.is_empty() {
         let alert = AlertRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -265,7 +277,7 @@ async fn upload_handler(
         
         state.alerts.write().unwrap().push_front(alert);
         
-        // Limitar historial a 50 alertas para no llenar RAM
+        // Mantener solo las últimas 50 alertas
         if state.alerts.read().unwrap().len() > 50 {
             state.alerts.write().unwrap().pop_back();
         }
