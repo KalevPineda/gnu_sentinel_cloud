@@ -1,5 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Multipart, Path, State},
+    http::{header, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -10,24 +13,25 @@ use std::{
     collections::VecDeque,
     fs::File,
     net::SocketAddr,
-    path::PathBuf, // Importante para rutas seguras en Linux
+    path::PathBuf,
     sync::{Arc, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir; // Importante para servir archivos estáticos
 
 // --- ESTRUCTURAS DE DATOS ---
 
-// 1. Configuración (Se envía al Core)
+// 1. Configuración (Actualizada con Gemini API Key)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct RemoteConfig {
-    max_temp_trigger: f32,   // Umbral de alerta
-    scan_wait_time_sec: u64, // Tiempo de espera en bordes
-    system_enabled: bool,    // Interruptor maestro
-    pan_step_degrees: f32,   // Velocidad
+    max_temp_trigger: f32,
+    scan_wait_time_sec: u64,
+    system_enabled: bool,
+    pan_step_degrees: f32,
+    // Campo opcional para la API Key de Gemini
+    pub gemini_api_key: Option<String>,
 }
 
-// 2. Estado en Vivo (Viene del Core)
+// 2. Estado en Vivo
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct LiveStatus {
     last_update: u64,
@@ -38,7 +42,7 @@ struct LiveStatus {
     is_online: bool,
 }
 
-// 3. Registro de Alerta (Historial para la Web)
+// 3. Registro de Alerta
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AlertRecord {
     id: String,
@@ -46,10 +50,10 @@ struct AlertRecord {
     turbine_token: String,
     max_temp: f32,
     angle: f32,
-    dataset_path: String, // Nombre del archivo .npz
+    dataset_path: String,
 }
 
-// 4. Punto de datos para graficar evolución
+// 4. Punto de datos para evolución
 #[derive(Serialize)]
 struct EvolutionPoint {
     frame_index: usize,
@@ -57,39 +61,47 @@ struct EvolutionPoint {
     avg_temp: f32,
 }
 
-// 5. Estado Global de la Aplicación (Memoria RAM)
-struct AppState {
-    config: Arc<RwLock<RemoteConfig>>,
-    live_status: Arc<RwLock<LiveStatus>>,
-    alerts: Arc<RwLock<VecDeque<AlertRecord>>>,
-}
-// 6. Estructura para listar archivos en el JSON
+// 5. Estructura para listar archivos
 #[derive(Serialize)]
 struct FileEntry {
     name: String,
     size_kb: u64,
     date: String,
-    #[serde(rename = "type")] // Renombramos para que en JSON salga "type"
+    #[serde(rename = "type")]
     file_type: String,
+}
+
+// 6. NUEVA: Estructura para devolver la Matriz Cruda (Heatmap)
+#[derive(Serialize)]
+struct ThermalFrameData {
+    width: usize,
+    height: usize,
+    min_temp: f32,
+    max_temp: f32,
+    // Aplanamos la matriz 2D a un vector 1D para enviarla fácil por JSON
+    pixels: Vec<f32>,
+}
+
+// 7. Estado Global
+struct AppState {
+    config: Arc<RwLock<RemoteConfig>>,
+    live_status: Arc<RwLock<LiveStatus>>,
+    alerts: Arc<RwLock<VecDeque<AlertRecord>>>,
 }
 
 #[tokio::main]
 async fn main() {
-    // Iniciar logs
     tracing_subscriber::fmt::init();
 
-    // Configuración CORS Permisiva (Para que tu Web pueda conectarse desde cualquier lugar)
+    // CORS Permisivo
     let cors = CorsLayer::new()
-        .allow_origin(Any)      
-        .allow_methods(Any)     
-        .allow_headers(Any);    
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
-    // Nombre de la carpeta de almacenamiento
     let storage_folder = "cloud_storage";
-
-    // Crear carpeta para guardar archivos si no existe
     if let Err(e) = std::fs::create_dir_all(storage_folder) {
-        eprintln!("⚠️ Advertencia: No se pudo crear carpeta {}: {}", storage_folder, e);
+        eprintln!("⚠️ Error creando carpeta {}: {}", storage_folder, e);
     } else {
         println!("📂 Carpeta '{}' lista.", storage_folder);
     }
@@ -101,10 +113,11 @@ async fn main() {
             scan_wait_time_sec: 5,
             system_enabled: true,
             pan_step_degrees: 0.5,
+            gemini_api_key: Some("".to_string()), // Inicializar vacío
         })),
         live_status: Arc::new(RwLock::new(LiveStatus {
             last_update: 0,
-            turbine_token: "Esperando conexión...".into(),
+            turbine_token: "Waiting...".into(),
             mode: "Offline".into(),
             current_angle: 0.0,
             current_max_temp: 0.0,
@@ -113,28 +126,27 @@ async fn main() {
         alerts: Arc::new(RwLock::new(VecDeque::new())),
     });
 
-    // Definición de Rutas
     let app = Router::new()
-        // --- API PARA LA INTERFAZ WEB / MÓVIL ---
-        .route("/api/live", get(get_live_status))                  
-        .route("/api/config", get(get_config).post(update_config)) 
-        .route("/api/alerts", get(get_alerts))                     
-        .route("/api/evolution/:filename", get(get_evolution_data)) 
+        // --- API WEB ---
+        .route("/api/live", get(get_live_status))
+        .route("/api/config", get(get_config).post(update_config))
+        .route("/api/alerts", get(get_alerts))
+        .route("/api/files", get(list_files_handler))
+        .route("/api/evolution/:filename", get(get_evolution_data))
         
-        // --- API PARA EL ROBOT (CORE) ---
-        .route("/ingest/heartbeat", post(heartbeat_handler)) 
+        // --- NUEVOS ENDPOINTS SOLICITADOS ---
+        // Descarga de archivos forzada
+        .route("/api/download/:filename", get(download_file_handler)) 
+        // Obtención de matriz cruda para visualización térmica
+        .route("/api/matrix/:filename/:frame_index", get(get_matrix_handler))
+        
+        // --- API ROBOT (CORE) ---
+        .route("/ingest/heartbeat", post(heartbeat_handler))
         .route("/ingest/upload", post(upload_handler))
-        .route("/api/files", get(list_files_handler)) // <--- AGREGAR ESTA LÍNEA  
         
-        // --- SERVICIO DE ARCHIVOS ESTÁTICOS (Corrección para descargar archivos) ---
-        // Esto permite que tu web acceda a: http://TU_VPS:8080/files/archivo.npz
-        //.nest_service("/files", ServeDir::new(storage_folder))
-
-        // Middleware
         .layer(cors)
         .with_state(shared_state);
 
-    // Escuchar en 0.0.0.0 es OBLIGATORIO para VPS
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("☁️ GSU Sentinel Cloud escuchando en http://{}", addr);
     
@@ -142,9 +154,82 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- HANDLERS ---
+// --- HANDLERS NUEVOS Y MODIFICADOS ---
 
-// [WEB] Listar archivos en la carpeta de almacenamiento
+// 1. NUEVO: Descarga forzada de archivos .npz
+async fn download_file_handler(Path(filename): Path<String>) -> impl IntoResponse {
+    let mut path = PathBuf::from("cloud_storage");
+    path.push(&filename);
+
+    // Verificación básica de seguridad (evitar ../)
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+         return (StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+    }
+
+    // Leemos el archivo asíncronamente
+    match tokio::fs::read(&path).await {
+        Ok(file_bytes) => {
+            // Convertimos bytes a Body de Axum
+            let body = Body::from(file_bytes);
+
+            // Configuramos headers para forzar descarga
+            let headers = [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", filename)),
+            ];
+
+            (headers, body).into_response()
+        },
+        Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+    }
+}
+
+// 2. NUEVO: Obtener Matriz Cruda (JSON)
+// Devuelve los datos necesarios para que el frontend dibuje el mapa de calor
+async fn get_matrix_handler(
+    Path((filename, frame_index)): Path<(String, usize)>
+) -> Result<Json<ThermalFrameData>, StatusCode> {
+    
+    let mut path = PathBuf::from("cloud_storage");
+    path.push(&filename);
+
+    // 1. Abrir archivo
+    let file = File::open(&path).map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // 2. Leer .npz
+    // Nota: Actualmente el Core guarda una única Array2<f32>.
+    // Si en el futuro guardas una pila (Array3), aquí deberías lógica para seleccionar el frame.
+    // Por ahora, ignoramos frame_index si es 0, o devolvemos error si piden > 0 en archivo simple.
+    
+    let matrix: Array2<f32> = Array2::<f32>::read_npy(file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if frame_index > 0 {
+        // Como el formato actual es solo 1 frame por archivo, si piden el index 1, 2... devolvemos error
+        // O podrías devolver el único frame que hay si prefieres ser permisivo.
+        return Err(StatusCode::BAD_REQUEST); 
+    }
+
+    let (rows, cols) = matrix.dim();
+    
+    // Estadísticas rápidas para normalización en frontend
+    let min_temp = matrix.fold(f32::INFINITY, |a, &b| a.min(b));
+    let max_temp = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+    // Aplanar datos (convertir [[1,2],[3,4]] a [1,2,3,4])
+    // as_standard_layout asegura que estén ordenados fila por fila
+    let pixels = matrix.as_standard_layout().into_owned().into_raw_vec();
+
+    Ok(Json(ThermalFrameData {
+        width: cols,
+        height: rows,
+        min_temp,
+        max_temp,
+        pixels,
+    }))
+}
+
+// --- HANDLERS EXISTENTES ---
+
 async fn list_files_handler() -> Json<Vec<FileEntry>> {
     let mut files = Vec::new();
     let path = "cloud_storage";
@@ -154,10 +239,7 @@ async fn list_files_handler() -> Json<Vec<FileEntry>> {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    
-                    // Solo listar archivos .npz o .txt relevantes
                     if name.ends_with(".npz") || name.ends_with(".txt") {
-                        // Formatear fecha (requiere chrono)
                         let date: chrono::DateTime<chrono::Utc> = metadata.modified()
                             .unwrap_or(std::time::SystemTime::now())
                             .into();
@@ -173,83 +255,66 @@ async fn list_files_handler() -> Json<Vec<FileEntry>> {
             }
         }
     }
-    
-    // Ordenar: más recientes primero
     files.sort_by(|a, b| b.date.cmp(&a.date));
     Json(files)
 }
 
-// [WEB] Obtener estado en vivo
 async fn get_live_status(State(state): State<Arc<AppState>>) -> Json<LiveStatus> {
     let mut status = state.live_status.read().unwrap().clone();
-    
-    // Si no hemos recibido datos en 5 segundos, marcar como Offline
     let now = chrono::Utc::now().timestamp() as u64;
-    // Chequeo de seguridad para evitar overflow en resta
     if now > status.last_update.saturating_add(5) {
         status.is_online = false;
         status.mode = "Lost Connection".to_string();
     }
-    
     Json(status)
 }
 
-// [WEB] Obtener Configuración
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<RemoteConfig> {
     Json(state.config.read().unwrap().clone())
 }
 
-// [WEB] Actualizar Configuración
 async fn update_config(
     State(state): State<Arc<AppState>>, 
     Json(new_conf): Json<RemoteConfig>
 ) -> Json<&'static str> {
     let mut conf = state.config.write().unwrap();
     *conf = new_conf;
-    println!("⚙️ Configuración actualizada vía Web: Trigger={}°C", conf.max_temp_trigger);
+    // Imprimir si se actualizó la Key
+    if let Some(ref key) = conf.gemini_api_key {
+        if !key.is_empty() {
+             println!("🔑 Gemini API Key actualizada.");
+        }
+    }
     Json("Config updated successfully")
 }
 
-// [WEB] Ver historial de alertas
 async fn get_alerts(State(state): State<Arc<AppState>>) -> Json<Vec<AlertRecord>> {
     let alerts = state.alerts.read().unwrap();
     Json(alerts.iter().cloned().collect())
 }
 
-// [WEB] Analizar archivo NPZ para gráficas
 async fn get_evolution_data(Path(filename): Path<String>) -> Json<Vec<EvolutionPoint>> {
-    // Uso de PathBuf para evitar ataques de directorio (ej ../../)
     let mut path = PathBuf::from("cloud_storage");
     path.push(&filename);
-    
     let mut points = Vec::new();
 
-    // Intentamos abrir el archivo
     if let Ok(file) = File::open(&path) {
-        // Leemos la matriz guardada
         if let Ok(matrix) = Array2::<f32>::read_npy(file) {
-            
-            // CORRECCIÓN: Usamos f32::NEG_INFINITY para evitar error de tipo ambiguo
             let max_val = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            
             let sum: f32 = matrix.sum();
             let count = matrix.len() as f32;
             let avg_val = if count > 0.0 { sum / count } else { 0.0 };
 
             points.push(EvolutionPoint { 
-                frame_index: 1, 
+                frame_index: 0, 
                 max_temp: max_val, 
                 avg_temp: avg_val 
             });
         }
-    } else {
-        println!("⚠️ Error: No se encontró el archivo {:?}", path);
     }
-    
     Json(points)
 }
 
-// [CORE] Heartbeat
 async fn heartbeat_handler(
     State(state): State<Arc<AppState>>, 
     Json(payload): Json<LiveStatus>
@@ -260,17 +325,14 @@ async fn heartbeat_handler(
         status.last_update = chrono::Utc::now().timestamp() as u64;
         status.is_online = true;
     }
-    // Responder con la configuración
     let config = state.config.read().unwrap().clone();
     Json(config)
 }
 
-// [CORE] Upload
 async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart
 ) -> Json<&'static str> {
-    
     let mut turbine_token = String::new();
     let mut angle = 0.0;
     let mut file_saved_name = String::new();
@@ -282,34 +344,27 @@ async fn upload_handler(
         if name == "turbine_token" {
             if let Ok(txt) = field.text().await { turbine_token = txt; }
         } else if name == "angle" {
-            if let Ok(txt) = field.text().await {
-                angle = txt.parse().unwrap_or(0.0);
-            }
+            if let Ok(txt) = field.text().await { angle = txt.parse().unwrap_or(0.0); }
         } else if name == "dataset_file" {
-            // Obtener bytes
             let data = field.bytes().await.unwrap();
             let timestamp = chrono::Utc::now().timestamp();
             
-            // Construir nombre y ruta segura
             file_saved_name = format!("capture_{}_{}.npz", turbine_token, timestamp);
             let mut filepath = PathBuf::from("cloud_storage");
             filepath.push(&file_saved_name);
             
-            // Guardar archivo
             if let Err(e) = tokio::fs::write(&filepath, &data).await {
                 eprintln!("❌ Error escribiendo archivo en {:?}: {}", filepath, e);
                 return Json("write_error");
             }
             println!("💾 Archivo recibido y guardado: {:?}", filepath);
             
-            // Análisis Rápido (sin leer de disco, usando los bytes en memoria)
             if let Ok(matrix) = Array2::<f32>::read_npy(std::io::Cursor::new(&data)) {
                  temp_max_detected = matrix.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             }
         }
     }
 
-    // Registrar Alerta
     if !file_saved_name.is_empty() {
         let alert = AlertRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -321,12 +376,9 @@ async fn upload_handler(
         };
         
         state.alerts.write().unwrap().push_front(alert);
-        
-        // Mantener solo las últimas 50 alertas
         if state.alerts.read().unwrap().len() > 50 {
             state.alerts.write().unwrap().pop_back();
         }
     }
-
     Json("upload_success")
 }
