@@ -63,6 +63,15 @@ struct AppState {
     live_status: Arc<RwLock<LiveStatus>>,
     alerts: Arc<RwLock<VecDeque<AlertRecord>>>,
 }
+// 6. Estructura para listar archivos en el JSON
+#[derive(Serialize)]
+struct FileEntry {
+    name: String,
+    size_kb: u64,
+    date: String,
+    #[serde(rename = "type")] // Renombramos para que en JSON salga "type"
+    file_type: String,
+}
 
 #[tokio::main]
 async fn main() {
@@ -114,11 +123,12 @@ async fn main() {
         
         // --- API PARA EL ROBOT (CORE) ---
         .route("/ingest/heartbeat", post(heartbeat_handler)) 
-        .route("/ingest/upload", post(upload_handler))       
+        .route("/ingest/upload", post(upload_handler))
+        .route("/api/files", get(list_files_handler)) // <--- AGREGAR ESTA LÍNEA  
         
         // --- SERVICIO DE ARCHIVOS ESTÁTICOS (Corrección para descargar archivos) ---
         // Esto permite que tu web acceda a: http://TU_VPS:8080/files/archivo.npz
-        .nest_service("/files", ServeDir::new(storage_folder))
+        //.nest_service("/files", ServeDir::new(storage_folder))
 
         // Middleware
         .layer(cors)
@@ -133,6 +143,41 @@ async fn main() {
 }
 
 // --- HANDLERS ---
+
+// [WEB] Listar archivos en la carpeta de almacenamiento
+async fn list_files_handler() -> Json<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    let path = "cloud_storage";
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    
+                    // Solo listar archivos .npz o .txt relevantes
+                    if name.ends_with(".npz") || name.ends_with(".txt") {
+                        // Formatear fecha (requiere chrono)
+                        let date: chrono::DateTime<chrono::Utc> = metadata.modified()
+                            .unwrap_or(std::time::SystemTime::now())
+                            .into();
+
+                        files.push(FileEntry {
+                            name: name.clone(),
+                            size_kb: metadata.len() / 1024,
+                            date: date.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            file_type: if name.contains("log") { "log".to_string() } else { "capture".to_string() },
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    // Ordenar: más recientes primero
+    files.sort_by(|a, b| b.date.cmp(&a.date));
+    Json(files)
+}
 
 // [WEB] Obtener estado en vivo
 async fn get_live_status(State(state): State<Arc<AppState>>) -> Json<LiveStatus> {
